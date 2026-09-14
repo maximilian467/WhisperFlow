@@ -1,150 +1,156 @@
-# WhisperFlow 🎙️
+# WhisperFlow
 
-Lokale **Speech-to-Text per Tastenkombination** für **Windows und Linux** — komplett offline, 0 € Kosten, keine Cloud, keine Anmeldung.
+Offline system-wide speech-to-text for Windows and Linux using [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
-Hotkey drücken → sprechen → Hotkey erneut drücken → der erkannte Text wird **direkt an deiner Cursorposition eingefügt** (egal ob Word, Browser, Chat, Code-Editor …).
+Press a hotkey, speak, press it again, and the recognized text is inserted **at the current cursor position** in whatever application is focused: Word, a browser, a chat window, a code editor.
 
-Basiert auf [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper, lokal auf der CPU).
+Runs locally on the CPU. No cloud, no account, no cost. The only network access is the one-time model download on first start.
 
----
+## Why I built it
 
-## Projektstruktur
+I wanted a dictation tool that works like Wispr Flow, but runs entirely on my own machine, costs nothing and sends nothing to the internet. It is the tool I use most in my daily work.
+
+## What it does
+
+- **Global hotkey** (default `Ctrl + Alt + W`), configurable, in two modes: `toggle` (press / press) or `push_to_talk` (hold).
+- **Local transcription** with faster-whisper; model, language, compute type, beam size, VAD filter and an initial prompt for domain terms are configurable.
+- **Paste-back into the active application**, either via the clipboard + `Ctrl+V` (default, reliable for umlauts) or by typing the text. On Windows the previous clipboard content is restored afterwards.
+- **Audio feedback**: short beeps for start, stop, done and error.
+- **Background mode / autostart** on Windows (Startup folder shortcut, no console window) and Linux (XDG autostart).
+- **Robustness details**: single-instance lock, automatic audio re-initialization after standby or headset changes, fallback to the device's native sample rate with resampling to 16 kHz, rotating log file.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Global hotkey<br/>Windows: RegisterHotKey<br/>Linux: evdev or pynput] --> B[Audio capture<br/>sounddevice, mono, 16 kHz]
+    B --> C[faster-whisper<br/>local, CPU, int8 by default]
+    C --> D[Text]
+    D --> E[Platform-specific output<br/>clipboard + paste keys, or typing]
+    E --> F[Active application]
+```
+
+Hotkey threads only enqueue `down` / `up` events. Recording control and transcription run in their own worker threads, so a slow microphone, a blocked console or a transcription error cannot stall hotkey detection.
+
+### Project structure
 
 ```
 WhisperFlow/
-├── config.json              Einstellungen (für beide Systeme)
-├── requirements.txt         Python-Pakete (plattformabhängig markiert)
-├── whisperflow/             Programmcode
-│   ├── app.py               Aufnahme, Transkription, Ablaufsteuerung
-│   ├── hotkey.py            Hotkey-Parser und Tastenerkennung
-│   ├── platform_windows.py  Windows: RegisterHotKey, Einfügen, Pieptöne
-│   └── platform_linux.py    Linux: evdev/pynput, xdotool/wtype, Töne
-├── windows/                 install.bat, start.bat, Autostart
-└── linux/                   install.sh, start.sh, Autostart
+├── config.json              Settings (shared by both platforms)
+├── requirements.txt         Python dependencies (with platform markers)
+├── whisperflow/
+│   ├── app.py               Recording, transcription, control flow
+│   ├── hotkey.py            Hotkey parser and key-state matching
+│   ├── platform_windows.py  Windows: RegisterHotKey, text insertion, beeps
+│   └── platform_linux.py    Linux: evdev/pynput, xdotool/wtype, beeps
+├── windows/                 install.bat, start.bat, autostart scripts
+└── linux/                   install.sh, start.sh, autostart scripts
 ```
 
-Das Log landet in `whisperflow.log` im Projektordner — praktisch, wenn WhisperFlow im Hintergrund läuft.
+## Technical details
 
----
+**Windows hotkeys.** Earlier versions used a low-level keyboard hook. Windows silently removes such hooks when they respond too slowly, which happened under CPU load during transcription. Missed key-release events (lock screen `Win+L`, `Ctrl+Alt+Del`, UAC, standby) also left modifiers "stuck", and clicking into the console (QuickEdit) froze the program. Since version 2, WhisperFlow uses `RegisterHotKey`, polls the real key state for key release, and disables QuickEdit. If a hotkey cannot be registered, it falls back to a keyboard hook via the `keyboard` library.
 
-## Windows
+**Linux: hotkeys and text insertion.** X11 and Wayland are supported (GNOME, KDE, wlroots compositors such as Sway/Hyprland).
 
-### Installation (einmalig)
-1. Doppelklick auf **`windows\install.bat`** → erstellt die Python-Umgebung und lädt alle Pakete.
-2. Doppelklick auf **`windows\start.bat`** → beim **allerersten Start** wird das Sprachmodell heruntergeladen (~500 MB für `small`). Danach läuft alles offline.
+| | X11 | Wayland |
+|---|---|---|
+| Hotkey | `pynput` (no extra permissions) | `evdev` via `/dev/input` (group `input`) |
+| Insert text | `xdotool` (otherwise `pynput`) | `wtype` → `/dev/uinput` → `ydotool` |
+| Clipboard | `xclip` / `xsel` | `wl-clipboard` |
 
-### Automatisch mit Windows starten (optional)
-- Aktivieren: **`windows\install-autostart.bat`** → startet unsichtbar im Hintergrund (nur Pieptöne als Feedback).
-- Deaktivieren: **`windows\install-autostart-entfernen.bat`**
+If no key-sending tool is available, the text is left in the clipboard and can be pasted manually with `Ctrl+V`.
 
-> Wer den Autostart schon mit der alten Version eingerichtet hatte: `windows\install-autostart.bat` einmal neu ausführen, damit die Verknüpfung auf den neuen Ordner zeigt.
+**Why not `Win + W`?** On Windows 11, `Win + W` is reserved for the Widgets panel. Windows does not let applications register it, so WhisperFlow would fall back to the less robust keyboard hook and the Widgets panel would still open. That is why the default is `Ctrl + Alt + W`. If you really want `Win + W`, turn off Widgets first (*Settings → Personalization → Taskbar → Widgets*) and set `"hotkey": "windows+w"`.
 
----
+## Installation / Running locally
 
-## Linux
+Requires Python 3 (with `venv`) and a working default microphone. On first start the selected model is downloaded (about 500 MB for `small`); after that everything runs offline.
 
-Unterstützt X11 und Wayland (GNOME, KDE, wlroots-Compositors wie Sway/Hyprland).
+### Windows
 
-### Installation (einmalig)
+1. Run **`windows\install.bat`**: creates the `venv` and installs `requirements.txt`.
+2. Run **`windows\start.bat`**: starts WhisperFlow in a console window.
+
+Optional autostart (hidden, beeps only):
+- Enable: `windows\install-autostart.bat`
+- Disable: `windows\install-autostart-entfernen.bat`
+
+> If you set up autostart with an older version, run `windows\install-autostart.bat` once more so the shortcut points to the new folder.
+
+### Linux
+
 ```bash
 chmod +x linux/*.sh
 ./linux/install.sh
-```
-Das Skript
-- installiert (nach Rückfrage, per `sudo`) Python-venv, Compiler, PortAudio sowie `xclip`/`xdotool` (X11) bzw. `wl-clipboard`/`wtype` (Wayland) — für apt, dnf, pacman und zypper,
-- legt die Python-Umgebung `venv/` an,
-- fragt unter **Wayland**, ob dein Benutzer in die Gruppe `input` darf (nötig für globale Hotkeys) und gibt `/dev/uinput` frei. Danach **einmal ab- und wieder anmelden**.
-
-### Starten
-```bash
 ./linux/start.sh
 ```
 
-### Autostart (optional)
-- Aktivieren: `./linux/install-autostart.sh` (XDG-Autostart, läuft nach dem Anmelden im Hintergrund)
-- Deaktivieren: `./linux/uninstall-autostart.sh`
+`install.sh`:
+- installs (after confirmation, via `sudo`) Python venv, compiler, PortAudio and `xclip`/`xdotool` (X11) or `wl-clipboard`/`wtype` (Wayland), for apt, dnf, pacman and zypper,
+- creates the Python environment `venv/`,
+- on **Wayland**, offers to add your user to the `input` group (needed for global hotkeys) and to enable `/dev/uinput`. Log out and back in once afterwards.
 
-### Wie Linux Hotkeys und Einfügen umsetzt
-| | X11 | Wayland |
+Optional autostart:
+- Enable: `./linux/install-autostart.sh` (XDG autostart, runs in the background after login)
+- Disable: `./linux/uninstall-autostart.sh`
+
+### Usage
+
+1. Start WhisperFlow (the console / terminal shows the status).
+2. Place the cursor where the text should go.
+3. Press **`Ctrl + Alt + W`**: high beep, **start speaking**.
+4. Press **`Ctrl + Alt + W`** again: low beep, wait briefly, the text appears.
+
+Quit with `Ctrl + C` in the console or by closing the window. Only one instance can run at a time. The log is written to `whisperflow.log` in the project folder, which is useful when WhisperFlow runs in the background.
+
+## Configuration: `config.json`
+
+Edit the file and restart WhisperFlow:
+
+| Setting | Meaning | Values |
 |---|---|---|
-| Hotkey | `pynput` (keine Rechte nötig) | `evdev` über `/dev/input` (Gruppe `input`) |
-| Einfügen | `xdotool` (sonst `pynput`) | `wtype` → `/dev/uinput` → `ydotool` |
-| Zwischenablage | `xclip` / `xsel` | `wl-clipboard` |
+| `hotkey` | Key combination | e.g. `ctrl+alt+w`, `f9`, `ctrl+shift+space` |
+| `mode` | Recording mode | `toggle` (press/press) or `push_to_talk` (hold) |
+| `model` | Accuracy vs. speed | `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `language` | Language | `de`, `en`, … or `auto` |
+| `compute_type` | Numeric precision | `int8` (fast), `int8_float32`, `float32` |
+| `paste_method` | How text is inserted | `clipboard` (Ctrl+V) or `type` |
+| `paste_keys` | Keys used to paste | `ctrl+v` (default), `ctrl+shift+v` for Linux terminals |
+| `add_trailing_space` | Append a space | `true` / `false` |
+| `sounds` | Beeps | `true` / `false` |
+| `initial_prompt` | Context / domain terms | e.g. `"Fachbegriffe: Kubernetes, Anthropic"` |
+| `linux_backend` | Hotkey detection on Linux | `auto`, `evdev`, `pynput` |
 
-Wenn gar kein Tastensender verfügbar ist, landet der Text in der Zwischenablage und du fügst ihn selbst mit `Strg+V` ein.
+`config.json` also contains `device` (default `cpu`), `beam_size` (default `1`) and `vad_filter` (default `true`), which are passed to faster-whisper.
 
-Hinweis zu `evdev`: Buchstaben beziehen sich auf die **physische Taste im US-Layout** — bei deutschem Layout sind `y` und `z` vertauscht.
+`push_to_talk` works with single keys (`f9`) and with combinations (`ctrl+alt+w`); recording stops as soon as the main key is released.
 
----
+### Which model?
 
-## Benutzung
+Without an NVIDIA GPU everything runs on the CPU. Rough guidance (estimates, not benchmarks):
+- **`small`** (default): good trade-off, roughly 1–3 s per sentence, good German.
+- **`base`**: faster, slightly less accurate.
+- **`medium`**: more accurate, but noticeably slower on the CPU.
 
-1. WhisperFlow starten (Konsolenfenster/Terminal zeigt den Status).
-2. Cursor dort platzieren, wo der Text hin soll.
-3. **`Strg + Alt + W`** drücken → es piept hoch → **sprechen**.
-4. **`Strg + Alt + W`** erneut drücken → es piept runter → kurz warten → Text erscheint.
+## Troubleshooting
 
-Beenden: `Strg + C` im Konsolenfenster oder Fenster schließen. Es kann immer nur eine Instanz gleichzeitig laufen.
+- **"Hotkey is already in use":** another program uses the combination; choose a different hotkey.
+- **"WhisperFlow is already running":** an instance is already running (e.g. via autostart).
+- **Text appears in the log but is not inserted:** some programs run as administrator (e.g. Task Manager), and a normal process cannot send keys to them. Start WhisperFlow as administrator too, or set `paste_method` to `type`.
+- **"Microphone could not be opened":** check that a default input device is set. After standby or a headset change, WhisperFlow re-initializes audio automatically.
+- **Hotkey stops responding after a while:** see *Windows hotkeys* above; check `whisperflow.log`.
+- **Linux: "no readable keyboard under /dev/input":** `sudo usermod -aG input $USER` and log in again, or on X11 set `"linux_backend": "pynput"`.
+- **Linux terminal does not paste:** set `"paste_keys": "ctrl+shift+v"`.
+- **Very slow:** choose a smaller model (`base` or `tiny`).
+- **Wrong language detected:** set `language` explicitly (e.g. `de`) instead of `auto`.
+- **Broken umlauts:** keep `paste_method` at `clipboard` (default).
 
----
+## Limitations
 
-## Einstellungen — `config.json`
-
-Datei mit einem Texteditor öffnen und Werte anpassen (danach Programm neu starten):
-
-| Einstellung | Bedeutung | Werte |
-|---|---|---|
-| `hotkey` | Tastenkombination | z. B. `ctrl+alt+w`, `f9`, `ctrl+shift+space` |
-| `mode` | Aufnahmemodus | `toggle` (drücken/drücken) oder `push_to_talk` (gedrückt halten) |
-| `model` | Genauigkeit vs. Tempo | `tiny`, `base`, `small`, `medium`, `large-v3` |
-| `language` | Sprache | `de`, `en`, … oder `auto` |
-| `compute_type` | Rechenpräzision | `int8` (schnell), `int8_float32`, `float32` |
-| `paste_method` | Einfügeart | `clipboard` (Strg+V) oder `type` (tippen) |
-| `paste_keys` | Tasten zum Einfügen | `ctrl+v` (Standard), `ctrl+shift+v` für Linux-Terminals |
-| `add_trailing_space` | Leerzeichen anhängen | `true` / `false` |
-| `sounds` | Pieptöne | `true` / `false` |
-| `initial_prompt` | Kontext/Fachbegriffe vorgeben | z. B. `"Fachbegriffe: Kubernetes, Anthropic"` |
-| `linux_backend` | Hotkey-Erkennung unter Linux | `auto`, `evdev`, `pynput` |
-
-### Welches Modell?
-Ohne NVIDIA-GPU läuft alles auf der CPU. Empfehlung:
-- **`small`** (Standard) — guter Kompromiss, ~1–3 s pro Satz, gutes Deutsch.
-- **`base`** — schneller, etwas ungenauer.
-- **`medium`** — genauer, aber spürbar langsamer auf der CPU.
-
-`push_to_talk` funktioniert mit einzelnen Tasten (`f9`) und mit Kombinationen (`ctrl+alt+w`) — die Aufnahme endet, sobald die Haupttaste losgelassen wird.
-
----
-
-## Warum nicht `Win + W`?
-
-`Win + W` ist in Windows 11 fest für das **Widgets-Panel** reserviert. Windows lässt Programme diese Kombination nicht registrieren; WhisperFlow weicht dann auf einen Tastatur-Hook aus, der weniger robust ist, und das Widgets-Fenster poppt trotzdem auf. Deshalb ist der Standard `Strg + Alt + W`.
-
-**Wenn du `Win + W` unbedingt willst**, schalte zuerst die Widgets ab (*Einstellungen → Personalisierung → Taskleiste → „Widgets" ausschalten*) und setze `"hotkey": "windows+w"`. Unkomplizierter sind freie Kombinationen wie `ctrl+alt+space` oder `f9`.
-
----
-
-## Problembehebung
-
-- **Hotkey reagiert nach einiger Zeit nicht mehr:** In älteren Versionen lief der Hotkey über einen Low-Level-Tastatur-Hook. Den entfernt Windows stillschweigend, wenn er unter CPU-Last (Transkription!) zu langsam antwortet. Außerdem brachten verpasste Tasten-Loslass-Events (Sperrbildschirm `Win+L`, `Strg+Alt+Entf`, UAC, Standby) die Erkennung dauerhaft durcheinander. Ein Klick ins Konsolenfenster (QuickEdit) hat das Programm zusätzlich eingefroren. Seit Version 2 nutzt WhisperFlow `RegisterHotKey`, fragt den echten Tastenzustand ab und schaltet QuickEdit ab. Tritt es trotzdem auf: `whisperflow.log` ansehen.
-- **„Hotkey ist bereits belegt":** Ein anderes Programm nutzt die Kombination → anderen Hotkey wählen.
-- **„WhisperFlow läuft bereits":** Es läuft schon eine Instanz (z. B. über den Autostart).
-- **Text wird nicht eingefügt, aber im Log steht er:** Manche Programme laufen als Administrator (z. B. Task-Manager). Dann kann ein normales Programm keine Tasten senden → WhisperFlow ebenfalls als Admin starten, oder `paste_method` auf `type` stellen.
-- **„Mikrofon konnte nicht geöffnet werden":** Prüfen, dass ein Standard-Eingabegerät gesetzt ist. Nach Standby oder Headset-Wechsel initialisiert WhisperFlow das Audio automatisch neu.
-- **Linux: „Keine lesbare Tastatur unter /dev/input":** `sudo usermod -aG input $USER`, neu anmelden — oder unter X11 `"linux_backend": "pynput"`.
-- **Linux-Terminal fügt nichts ein:** `"paste_keys": "ctrl+shift+v"` setzen.
-- **Sehr langsam:** Kleineres Modell wählen (`base` oder `tiny`).
-- **Falsche Sprache erkannt:** `language` fest auf `de` stellen (statt `auto`).
-- **Umlaute kaputt:** `paste_method` auf `clipboard` lassen (Standard).
-
----
-
-## Wie es funktioniert
-
-```
-Hotkey → Mikrofon-Aufnahme (sounddevice, 16 kHz)
-       → Whisper-Transkription (faster-whisper, lokal/CPU)
-       → Text in Zwischenablage + Strg+V an Cursorposition
-```
-
-Alles passiert auf deinem Rechner. Es werden **keine Daten ins Internet gesendet** (außer dem einmaligen Modell-Download bei der ersten Nutzung).
+- Windows and Linux only; other operating systems are not supported.
+- Audio shorter than 0.3 s is ignored.
+- On Windows, text cannot be sent to applications running with higher privileges unless WhisperFlow runs elevated as well.
+- On Linux with `evdev`, letters refer to the **physical key in the US layout**; on a German layout `y` and `z` are swapped.
+- Global hotkeys on Wayland require membership in the `input` group.
+- The user interface messages and log output are in German.
