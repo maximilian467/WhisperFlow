@@ -11,10 +11,12 @@ Alles laeuft lokal auf deinem Rechner. Keine Cloud, keine Kosten.
 import os
 import sys
 import json
+import atexit
 import time
 import queue
 import logging
 import threading
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 # HuggingFace-Cache-Warnung unter Windows unterdruecken (rein kosmetisch)
@@ -45,9 +47,49 @@ DEFAULTS = {
     "sounds": True,
     "initial_prompt": "",
     "linux_backend": "auto",      # "auto" | "evdev" | "pynput" (nur Linux)
+    "status_file": True,          # Zustand fuer andere Apps (z. B. Developer Island) mitschreiben
 }
 
 log = logging.getLogger("whisperflow")
+
+
+def status_path():
+    """Windows: %LOCALAPPDATA%\\WhisperFlow\\status.json, Linux: ~/.local/state/whisperflow/status.json"""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "WhisperFlow", "status.json")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "whisperflow", "status.json")
+
+
+class StatusFile:
+    """Schreibt nur den aktuellen Zustand (kein Audio, kein Text) in eine kleine JSON-Datei,
+    damit andere Programme anzeigen koennen, ob WhisperFlow gerade aufnimmt oder transkribiert.
+    Zustaende: loading, ready, recording, transcribing, done, empty, error, stopped.
+    Fehler beim Schreiben werden ignoriert - die Statusdatei darf WhisperFlow nie stoeren."""
+
+    def __init__(self, enabled):
+        self.path = status_path() if enabled else None
+        self._lock = threading.Lock()
+
+    def write(self, state):
+        if not self.path:
+            return
+        data = {
+            "version": 1,
+            "state": state,
+            "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "pid": os.getpid(),
+        }
+        with self._lock:
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                temp = f"{self.path}.{os.getpid()}.tmp"
+                with open(temp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(temp, self.path)
+            except OSError:
+                pass
 
 
 def setup_logging():
@@ -172,10 +214,11 @@ class Controller:
     passiert in eigenen Threads. So kann ein langsames Mikrofon, eine blockierte
     Konsole oder ein Fehler niemals die Hotkey-Erkennung lahmlegen."""
 
-    def __init__(self, cfg, model, plat):
+    def __init__(self, cfg, model, plat, status):
         self.cfg = cfg
         self.model = model
         self.plat = plat
+        self.status = status
         self.inserter = plat.TextInserter(cfg)
         self.recorder = Recorder()
         self.push_to_talk = cfg.get("mode", "toggle") == "push_to_talk"
@@ -211,6 +254,7 @@ class Controller:
             except Exception:
                 log.exception("[ERR] Fehler bei der Hotkey-Verarbeitung")
                 self.beep("error")
+                self._report_result("error")
 
     def _start_recording(self):
         try:
@@ -218,17 +262,20 @@ class Controller:
         except Exception as e:
             log.error("[ERR] Mikrofon konnte nicht geoeffnet werden: %s", e)
             self.beep("error")
+            self._report_result("error")
             return
         if self.push_to_talk:
             log.info("[REC] Aufnahme laeuft ... (Hotkey loslassen zum Stoppen)")
         else:
             log.info("[REC] Aufnahme laeuft ... (Hotkey erneut druecken zum Stoppen)")
+        self.status.write("recording")
         self.beep("start")
 
     def _stop_recording(self):
         audio = self.recorder.stop()
         self.beep("stop")
         log.info("[REC] Stop. %.1fs Audio aufgenommen.", audio.size / SAMPLE_RATE)
+        self.status.write("transcribing")
         self._jobs.put(audio)
 
     def _job_loop(self):
@@ -239,6 +286,16 @@ class Controller:
             except Exception:
                 log.exception("[ERR] Transkription fehlgeschlagen")
                 self.beep("error")
+                self._report_result("error")
+
+    def _report_result(self, state):
+        """Ergebnis melden - ausser es laeuft schon die naechste Aufnahme oder Transkription,
+        dann bleibt deren Zustand stehen."""
+        if self.recorder.recording:
+            return
+        if not self._jobs.empty():
+            return
+        self.status.write(state)
 
     def _process(self, audio):
         log.info("[..] Transkribiere ...")
@@ -248,12 +305,14 @@ class Controller:
         if not text:
             log.info("[--] Nichts erkannt (%.1fs).", dt)
             self.beep("error")
+            self._report_result("empty")
             return
         if self.cfg.get("add_trailing_space", True):
             text += " "
         log.info("[OK] (%.1fs) -> %r", dt, text)
         self.inserter.insert(text)
         self.beep("done")
+        self._report_result("done")
 
     def _transcribe(self, audio):
         if audio.size < SAMPLE_RATE * 0.3:  # weniger als 0,3 s -> ignorieren
@@ -283,6 +342,11 @@ def main():
         sys.exit(1)
     plat.prepare_console()
 
+    # Erst nach der Einzelinstanz-Pruefung: eine zweite Instanz darf den Status nicht ueberschreiben.
+    status = StatusFile(cfg.get("status_file", True))
+    atexit.register(status.write, "stopped")
+    status.write("loading")
+
     try:
         hotkey = parse_hotkey(cfg.get("hotkey", "ctrl+alt+w"))
     except ValueError as e:
@@ -310,7 +374,7 @@ def main():
     log.info(" Modell geladen in %.1fs.", time.time() - t0)
     log.info("-" * 56)
 
-    controller = Controller(cfg, model, plat)
+    controller = Controller(cfg, model, plat, status)
     listener = plat.create_hotkey_listener(cfg, hotkey, controller.hotkey_down, controller.hotkey_up)
     try:
         listener.start()
@@ -324,7 +388,10 @@ def main():
         log.info(" Bereit. Druecke '%s' zum Starten/Stoppen.", cfg["hotkey"])
     log.info(" Beenden: Strg+C in diesem Fenster (oder Fenster schliessen).")
     log.info(" Log-Datei: %s", LOG_PATH)
+    if status.path:
+        log.info(" Status:    %s", status.path)
     log.info("=" * 56)
+    status.write("ready")
 
     try:
         while True:

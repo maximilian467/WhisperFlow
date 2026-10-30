@@ -121,10 +121,21 @@ Edit the file and restart WhisperFlow:
 | `sounds` | Beeps | `true` / `false` |
 | `initial_prompt` | Context / domain terms | e.g. `"Fachbegriffe: Kubernetes, Anthropic"` |
 | `linux_backend` | Hotkey detection on Linux | `auto`, `evdev`, `pynput` |
+| `status_file` | Write the current state for other apps (see below) | `true` / `false` |
 
 `config.json` also contains `device` (default `cpu`), `beam_size` (default `1`) and `vad_filter` (default `true`), which are passed to faster-whisper.
 
 `push_to_talk` works with single keys (`f9`) and with combinations (`ctrl+alt+w`); recording stops as soon as the main key is released.
+
+### Status file (for example for Developer Island)
+
+WhisperFlow writes its current state to a small file: `%LOCALAPPDATA%\WhisperFlow\status.json` on Windows, `~/.local/state/whisperflow/status.json` on Linux.
+
+```json
+{"version": 1, "state": "transcribing", "at": "2026-10-30T09:00:00.250+00:00", "pid": 1234}
+```
+
+`state` is `loading`, `ready`, `recording`, `transcribing`, `done`, `empty` (nothing recognized), `error` or `stopped`. The file holds **only the state**: no audio and no recognized text. [Developer Island](https://github.com/maximilian467/Developer-Island) uses it to show next to its microphone mark whether WhisperFlow is recording, transcribing, or whether the dictation worked (Settings, Modules, WhisperFlow). Set `"status_file": false` to turn it off.
 
 ### Which model?
 
